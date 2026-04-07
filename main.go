@@ -92,76 +92,85 @@ func (store *TaskStore) Delete(id int) bool {
 	return false // 見つからなかった
 }
 
-// taskStore はアプリ全体で共有するタスクの保存場所です。
-var taskStore = NewTaskStore()
+const maxTitleLength = 200 // タイトルの最大文字数
 
 // sendJSON はHTTPレスポンスとしてJSONを返すヘルパー関数です。
 func sendJSON(responseWriter http.ResponseWriter, statusCode int, data any) {
 	responseWriter.Header().Set("Content-Type", "application/json")
 	responseWriter.WriteHeader(statusCode)
-	json.NewEncoder(responseWriter).Encode(data)
+	if err := json.NewEncoder(responseWriter).Encode(data); err != nil {
+		log.Printf("JSONエンコードエラー: %v", err)
+	}
 }
 
 // tasksHandler は /api/tasks へのリクエストを処理します。
 // GET  → タスク一覧を返す
 // POST → 新しいタスクを追加する
-func tasksHandler(responseWriter http.ResponseWriter, request *http.Request) {
-	switch request.Method {
+func tasksHandler(store *TaskStore) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		switch request.Method {
 
-	case http.MethodGet:
-		// タスク一覧をJSONで返す
-		sendJSON(responseWriter, http.StatusOK, taskStore.GetAll())
+		case http.MethodGet:
+			// タスク一覧をJSONで返す
+			sendJSON(responseWriter, http.StatusOK, store.GetAll())
 
-	case http.MethodPost:
-		// リクエストボディから title を取り出す
-		var requestBody struct {
-			Title string `json:"title"`
+		case http.MethodPost:
+			// リクエストボディから title を取り出す
+			var requestBody struct {
+				Title string `json:"title"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&requestBody); err != nil || requestBody.Title == "" {
+				http.Error(responseWriter, "タイトルが不正です", http.StatusBadRequest)
+				return
+			}
+			if len([]rune(requestBody.Title)) > maxTitleLength {
+				http.Error(responseWriter, "タイトルが長すぎます", http.StatusBadRequest)
+				return
+			}
+			addedTask := store.Add(requestBody.Title)
+			sendJSON(responseWriter, http.StatusCreated, addedTask)
+
+		default:
+			http.Error(responseWriter, "許可されていないメソッドです", http.StatusMethodNotAllowed)
 		}
-		if err := json.NewDecoder(request.Body).Decode(&requestBody); err != nil || requestBody.Title == "" {
-			http.Error(responseWriter, "タイトルが不正です", http.StatusBadRequest)
-			return
-		}
-		addedTask := taskStore.Add(requestBody.Title)
-		sendJSON(responseWriter, http.StatusCreated, addedTask)
-
-	default:
-		http.Error(responseWriter, "許可されていないメソッドです", http.StatusMethodNotAllowed)
 	}
 }
 
 // taskHandler は /api/tasks/{id} へのリクエストを処理します。
 // PATCH  → 完了状態を切り替える
 // DELETE → タスクを削除する
-func taskHandler(responseWriter http.ResponseWriter, request *http.Request) {
-	// URLパスから {id} 部分を取り出して数値に変換する
-	idString := request.PathValue("id")
-	taskID, err := strconv.Atoi(idString)
-	if err != nil {
-		http.Error(responseWriter, "IDが不正です", http.StatusBadRequest)
-		return
-	}
-
-	switch request.Method {
-
-	case http.MethodPatch:
-		// 完了状態を切り替える
-		updatedTask, found := taskStore.Toggle(taskID)
-		if !found {
-			http.Error(responseWriter, "タスクが見つかりません", http.StatusNotFound)
+func taskHandler(store *TaskStore) http.HandlerFunc {
+	return func(responseWriter http.ResponseWriter, request *http.Request) {
+		// URLパスから {id} 部分を取り出して数値に変換する
+		idString := request.PathValue("id")
+		taskID, err := strconv.Atoi(idString)
+		if err != nil {
+			http.Error(responseWriter, "IDが不正です", http.StatusBadRequest)
 			return
 		}
-		sendJSON(responseWriter, http.StatusOK, updatedTask)
 
-	case http.MethodDelete:
-		// タスクを削除する
-		if !taskStore.Delete(taskID) {
-			http.Error(responseWriter, "タスクが見つかりません", http.StatusNotFound)
-			return
+		switch request.Method {
+
+		case http.MethodPatch:
+			// 完了状態を切り替える
+			updatedTask, found := store.Toggle(taskID)
+			if !found {
+				http.Error(responseWriter, "タスクが見つかりません", http.StatusNotFound)
+				return
+			}
+			sendJSON(responseWriter, http.StatusOK, updatedTask)
+
+		case http.MethodDelete:
+			// タスクを削除する
+			if !store.Delete(taskID) {
+				http.Error(responseWriter, "タスクが見つかりません", http.StatusNotFound)
+				return
+			}
+			responseWriter.WriteHeader(http.StatusNoContent) // 削除成功（返すデータなし）
+
+		default:
+			http.Error(responseWriter, "許可されていないメソッドです", http.StatusMethodNotAllowed)
 		}
-		responseWriter.WriteHeader(http.StatusNoContent) // 削除成功（返すデータなし）
-
-	default:
-		http.Error(responseWriter, "許可されていないメソッドです", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -255,7 +264,8 @@ function escapeHtml(text) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
 }
 
 // 入力欄のタスクをサーバーに送信して追加する
@@ -301,16 +311,20 @@ loadTasks();
 // indexPageHandler はブラウザからのリクエストにHTMLページを返します。
 func indexPageHandler(responseWriter http.ResponseWriter, request *http.Request) {
 	responseWriter.Header().Set("Content-Type", "text/html; charset=utf-8")
-	indexPage.Execute(responseWriter, nil)
+	if err := indexPage.Execute(responseWriter, nil); err != nil {
+		log.Printf("テンプレート実行エラー: %v", err)
+	}
 }
 
 func main() {
+	store := NewTaskStore()
+
 	// ルーター（URLとハンドラーの対応表）を作成する
 	router := http.NewServeMux()
 
-	router.HandleFunc("/", indexPageHandler)              // トップページ（HTML）
-	router.HandleFunc("/api/tasks", tasksHandler)         // タスク一覧の取得・追加
-	router.HandleFunc("/api/tasks/{id}", taskHandler)     // 個別タスクの更新・削除
+	router.HandleFunc("/", indexPageHandler)                      // トップページ（HTML）
+	router.HandleFunc("/api/tasks", tasksHandler(store))          // タスク一覧の取得・追加
+	router.HandleFunc("/api/tasks/{id}", taskHandler(store))      // 個別タスクの更新・削除
 
 	log.Println("サーバー起動: http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", router))
